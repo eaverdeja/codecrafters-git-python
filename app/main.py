@@ -1,8 +1,9 @@
 import sys
 import os
 import zlib
+from hashlib import sha1
 from argparse import ArgumentParser
-from pathlib import Path
+
 
 def main():
     # https://blog.meain.io/2023/what-is-in-dot-git/
@@ -29,9 +30,8 @@ def main():
             object_hash = args.object_hash
             folder = object_hash[0:2]
             filename = object_hash[2:]
-            cwd = os.getcwd()
             
-            with open(Path(cwd)/'.git/objects'/folder/filename, 'rb') as file:
+            with open(f".git/objects/{folder}/{filename}", 'rb') as file:
                 compressed_contents = file.read()
                 
             contents = zlib.decompress(compressed_contents)
@@ -46,6 +46,36 @@ def main():
             contents = contents[end_of_size_marker + 1 : end_of_size_marker + content_size + 1].decode()
             
             sys.stdout.write(contents)
+        case "hash-object":
+            parser = ArgumentParser(description="Computes the SHA hash of a git object. Optionally writes the object.")
+            parser.add_argument('file_name')
+            parser.add_argument(
+                "--write",
+                "-w",
+                action="store_true",
+                help="Specifies that the git object should be written to .git/objects",
+            )
+            args = parser.parse_args(sys.argv[2:])
+            file_name = args.file_name
+
+            with open(file_name, 'rb') as file:
+                contents = file.read()
+            
+            content_length = len(contents)
+            blob_object = b'blob ' + str(content_length).encode() + b'\0' + contents
+            object_hash = sha1(blob_object).hexdigest()
+            
+            if args.write:
+                folder = object_hash[0:2]
+                filename = object_hash[2:]
+                if not os.path.isdir(f".git/objects/{folder}"):
+                    os.mkdir(f".git/objects/{folder}")
+                
+                compressed_object = zlib.compress(blob_object)
+                with open(f".git/objects/{folder}/{filename}", 'wb') as file:
+                    file.write(compressed_object)
+            
+            print(object_hash)
         case _:
             raise RuntimeError(f"Unknown command #{command}")
 
