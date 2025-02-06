@@ -12,6 +12,15 @@ class TreeEntry:
     name: str
     sha_hash: str
 
+    def to_bytes(self) -> bytes:
+        return (
+            self.mode.encode()
+            + b" "
+            + self.name.encode()
+            + b"\x00"
+            + bytes.fromhex(self.sha_hash)
+        )
+
 
 def main():
     # https://blog.meain.io/2023/what-is-in-dot-git/
@@ -144,8 +153,78 @@ def main():
             if args.name_only:
                 for entry in sorted(parsed_entries, key=lambda entry: entry.name):
                     print(entry.name)
+        case "write-tree":
+            object_hash = write_tree()
+            print(object_hash)
         case _:
             raise RuntimeError(f"Unknown command #{command}")
+
+
+def write_tree(path: str | None = None) -> str:
+    entries: dict[str | bytes, TreeEntry] = {}
+    for entry in os.scandir(path):
+        if entry.is_file():
+            with open(entry.path, "rb") as file:
+                contents = file.read()
+
+            content_length = len(contents)
+            blob_object = b"blob " + str(content_length).encode() + b"\0" + contents
+            object_hash = sha1(blob_object).digest()
+
+            entries[object_hash] = TreeEntry(
+                mode=_get_mode_for_entry(entry),
+                name=entry.name,
+                sha_hash=object_hash.hex(),
+            )
+        elif entry.is_dir():
+            if entry.name in [".git", ".venv", "__pycache__"]:
+                continue
+            sha_hash = write_tree(entry.path)
+
+            entries[sha_hash] = TreeEntry(
+                mode=_get_mode_for_entry(entry),
+                name=entry.name,
+                sha_hash=sha_hash,
+            )
+
+    contents = b"".join(
+        [
+            entry.to_bytes()
+            for entry in sorted(entries.values(), key=lambda entry: entry.name)
+        ]
+    )
+
+    return write_contents_to_disk(contents)
+
+
+def write_contents_to_disk(contents: bytes) -> str:
+    content_length = len(contents)
+
+    blob_object = b"tree " + str(content_length).encode() + b"\x00" + contents
+    object_hash = sha1(blob_object).hexdigest()
+
+    folder = object_hash[0:2]
+    filename = object_hash[2:]
+    if not os.path.isdir(f".git/objects/{folder}"):
+        os.mkdir(f".git/objects/{folder}")
+
+    compressed_object = zlib.compress(blob_object)
+    with open(f".git/objects/{folder}/{filename}", "wb") as file:
+        file.write(compressed_object)
+
+    return object_hash
+
+
+def _get_mode_for_entry(entry: os.DirEntry) -> str:
+    if entry.is_dir():
+        return "40000"
+    if entry.is_symlink():
+        return "120000"
+    if entry.is_file():
+        if os.access(entry.path, os.X_OK):
+            return "100755"
+        return "100644"
+    raise Exception("Invalid entry")
 
 
 if __name__ == "__main__":
