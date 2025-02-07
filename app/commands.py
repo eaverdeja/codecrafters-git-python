@@ -4,6 +4,7 @@ from hashlib import sha1
 from dataclasses import dataclass
 import sys
 import zlib
+from pprint import pprint
 
 from app.encoder import encode_object
 from app.writer import write_contents_to_disk
@@ -127,8 +128,8 @@ def ls_tree(tree_hash: str) -> list[TreeEntry]:
     return parsed_entries
 
 
-def write_tree() -> str:
-    tree = _create_tree()
+def write_tree(path: str | None = None) -> str:
+    tree = _create_tree(path)
     _, contents = _encode_tree(tree)
     object_hash = write_contents_to_disk(contents, "tree")
 
@@ -153,8 +154,18 @@ def commit_tree(tree_sha: str, parent: str, message: str) -> str:
     return object_hash
 
 
-def _create_tree(path: str | None = None) -> dict[bytes, TreeEntry]:
-    tree: dict[bytes, TreeEntry] = {}
+def clone(url: str, directory: str):
+    """
+    Just compiling some info and docs for now:
+    https://app.codecrafters.io/courses/git/stages/mg6
+    https://forum.codecrafters.io/t/step-for-git-clone-implementing-the-git-protocol/4407/3
+    https://i27ae15.github.io/git-protocol-doc/docs/git-protocol/intro
+    """
+    ...
+
+
+def _create_tree(path: str | None) -> list[TreeEntry]:
+    tree: list[TreeEntry] = []
     for entry in os.scandir(path):
         if entry.is_file():
             with open(entry.path, "rb") as file:
@@ -162,34 +173,36 @@ def _create_tree(path: str | None = None) -> dict[bytes, TreeEntry]:
 
             content_length = len(contents)
             blob_object = b"blob " + str(content_length).encode() + b"\0" + contents
-            object_hash = sha1(blob_object).digest()
+            object_hash = sha1(blob_object).hexdigest()
 
-            tree[object_hash] = TreeEntry(
-                mode=_get_mode_for_entry(entry),
-                name=entry.name,
-                sha_hash=object_hash.hex(),
+            write_contents_to_disk(contents, "blob")
+
+            tree.append(
+                TreeEntry(
+                    mode=_get_mode_for_entry(entry),
+                    name=entry.name,
+                    sha_hash=object_hash,
+                )
             )
         elif entry.is_dir():
             if entry.name in [".git"]:
                 continue
 
-            sub_tree = _create_tree(entry.path)
-            object_hash, _ = _encode_tree(sub_tree)
-            tree[object_hash] = TreeEntry(
-                mode=_get_mode_for_entry(entry),
-                name=entry.name,
-                sha_hash=object_hash.hex(),
+            object_hash = write_tree(entry.path)
+            tree.append(
+                TreeEntry(
+                    mode=_get_mode_for_entry(entry),
+                    name=entry.name,
+                    sha_hash=object_hash,
+                )
             )
 
     return tree
 
 
-def _encode_tree(tree: dict[bytes, TreeEntry]) -> tuple[bytes, bytes]:
+def _encode_tree(tree: list[TreeEntry]) -> tuple[bytes, bytes]:
     contents = b"".join(
-        [
-            entry.to_bytes()
-            for entry in sorted(tree.values(), key=lambda entry: entry.name)
-        ]
+        [entry.to_bytes() for entry in sorted(tree, key=lambda entry: entry.name)]
     )
 
     blob_object = encode_object(contents, "tree")
