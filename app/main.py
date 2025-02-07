@@ -156,11 +156,36 @@ def main():
         case "write-tree":
             tree = create_tree()
             _, contents = encode_tree(tree)
-            object_hash = write_contents_to_disk(contents)
+            object_hash = write_contents_to_disk(contents, "tree")
 
             print(object_hash)
         case "commit-tree":
-            ...
+            parser = ArgumentParser(description="Creates a commit object")
+            parser.add_argument("tree_sha")
+            parser.add_argument(
+                "-p",
+                "--parent",
+                help="Specifies the parent commit",
+            )
+            parser.add_argument(
+                "-m",
+                "--message",
+                help="The commit message",
+            )
+            args = parser.parse_args(sys.argv[2:])
+            tree_sha = args.tree_sha
+            parent = args.parent
+            message = args.message
+
+            contents = b"tree " + str(tree_sha).encode() + b"\n"
+            contents += b"parent " + str(parent).encode() + b"\n"
+            contents += b"author eaverdeja <eaverdeja@gmail.com> 1738923862 -0300\n"
+            contents += b"committer eaverdeja <eaverdeja@gmail.com> 1738923862 -0300\n"
+            contents += b"\n" + str(message).encode() + b"\n"
+
+            object_hash = write_contents_to_disk(contents, "commit")
+
+            print(object_hash)
         case _:
             raise RuntimeError(f"Unknown command #{command}")
 
@@ -182,7 +207,7 @@ def create_tree(path: str | None = None) -> dict[bytes, TreeEntry]:
                 sha_hash=object_hash.hex(),
             )
         elif entry.is_dir():
-            if entry.name in [".git", ".venv", "__pycache__"]:
+            if entry.name in [".git"]:
                 continue
 
             sub_tree = create_tree(entry.path)
@@ -204,18 +229,14 @@ def encode_tree(tree: dict[bytes, TreeEntry]) -> tuple[bytes, bytes]:
         ]
     )
 
-    content_length = len(contents)
-
-    blob_object = b"tree " + str(content_length).encode() + b"\x00" + contents
+    blob_object = _encode_object(contents, "tree")
     object_hash = sha1(blob_object).digest()
 
     return object_hash, contents
 
 
-def write_contents_to_disk(contents: bytes) -> str:
-    content_length = len(contents)
-
-    blob_object = b"tree " + str(content_length).encode() + b"\x00" + contents
+def write_contents_to_disk(contents: bytes, content_type: str) -> str:
+    blob_object = _encode_object(contents, content_type)
     object_hash = sha1(blob_object).hexdigest()
 
     folder = object_hash[0:2]
@@ -228,6 +249,12 @@ def write_contents_to_disk(contents: bytes) -> str:
         file.write(compressed_object)
 
     return object_hash
+
+
+def _encode_object(contents: bytes, content_type: str) -> bytes:
+    return (
+        content_type.encode() + b" " + str(len(contents)).encode() + b"\x00" + contents
+    )
 
 
 def _get_mode_for_entry(entry: os.DirEntry) -> str:
