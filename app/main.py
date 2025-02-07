@@ -154,14 +154,19 @@ def main():
                 for entry in sorted(parsed_entries, key=lambda entry: entry.name):
                     print(entry.name)
         case "write-tree":
-            object_hash = write_tree()
+            tree = create_tree()
+            _, contents = encode_tree(tree)
+            object_hash = write_contents_to_disk(contents)
+
             print(object_hash)
+        case "commit-tree":
+            ...
         case _:
             raise RuntimeError(f"Unknown command #{command}")
 
 
-def write_tree(path: str | None = None) -> str:
-    entries: dict[str | bytes, TreeEntry] = {}
+def create_tree(path: str | None = None) -> dict[bytes, TreeEntry]:
+    tree: dict[bytes, TreeEntry] = {}
     for entry in os.scandir(path):
         if entry.is_file():
             with open(entry.path, "rb") as file:
@@ -171,7 +176,7 @@ def write_tree(path: str | None = None) -> str:
             blob_object = b"blob " + str(content_length).encode() + b"\0" + contents
             object_hash = sha1(blob_object).digest()
 
-            entries[object_hash] = TreeEntry(
+            tree[object_hash] = TreeEntry(
                 mode=_get_mode_for_entry(entry),
                 name=entry.name,
                 sha_hash=object_hash.hex(),
@@ -179,22 +184,32 @@ def write_tree(path: str | None = None) -> str:
         elif entry.is_dir():
             if entry.name in [".git", ".venv", "__pycache__"]:
                 continue
-            sha_hash = write_tree(entry.path)
 
-            entries[sha_hash] = TreeEntry(
+            sub_tree = create_tree(entry.path)
+            object_hash, _ = encode_tree(sub_tree)
+            tree[object_hash] = TreeEntry(
                 mode=_get_mode_for_entry(entry),
                 name=entry.name,
-                sha_hash=sha_hash,
+                sha_hash=object_hash.hex(),
             )
 
+    return tree
+
+
+def encode_tree(tree: dict[bytes, TreeEntry]) -> tuple[bytes, bytes]:
     contents = b"".join(
         [
             entry.to_bytes()
-            for entry in sorted(entries.values(), key=lambda entry: entry.name)
+            for entry in sorted(tree.values(), key=lambda entry: entry.name)
         ]
     )
 
-    return write_contents_to_disk(contents)
+    content_length = len(contents)
+
+    blob_object = b"tree " + str(content_length).encode() + b"\x00" + contents
+    object_hash = sha1(blob_object).digest()
+
+    return object_hash, contents
 
 
 def write_contents_to_disk(contents: bytes) -> str:
