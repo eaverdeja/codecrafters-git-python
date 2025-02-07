@@ -11,11 +11,13 @@ def write_contents_to_disk(contents: bytes, object_type: str) -> str:
 
     folder = object_hash[0:2]
     filename = object_hash[2:]
+
     if not os.path.isdir(f".git/objects/{folder}"):
         os.mkdir(f".git/objects/{folder}")
 
-    compressed_object = zlib.compress(blob_object)
-    with open(f".git/objects/{folder}/{filename}", "wb") as file:
-        file.write(compressed_object)
+        compressed_object = zlib.compress(blob_object)
+
+        with open(f".git/objects/{folder}/{filename}", "wb") as file:
+            file.write(compressed_object)
 
     return object_hash

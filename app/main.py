@@ -1,7 +1,15 @@
 from argparse import ArgumentParser
 import sys
 
-from app.commands import cat_file, commit_tree, hash_object, init, ls_tree, write_tree
+from app.commands import (
+    cat_file,
+    clone,
+    commit_tree,
+    hash_object,
+    init,
+    ls_tree,
+    write_tree,
+)
 
 
 def main():
@@ -74,6 +82,8 @@ def main():
             object_hash = commit_tree(tree_sha, parent, message)
 
             print(object_hash)
+        case "clone":
+            clone()
         case _:
             raise RuntimeError(f"Unknown command #{command}")
 

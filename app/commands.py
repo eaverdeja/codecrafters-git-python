@@ -4,7 +4,6 @@ from hashlib import sha1
 from dataclasses import dataclass
 import sys
 import zlib
-from pprint import pprint
 
 from app.encoder import encode_object
 from app.writer import write_contents_to_disk
