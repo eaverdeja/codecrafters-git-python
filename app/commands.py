@@ -2,13 +2,14 @@ from argparse import ArgumentParser
 import os
 from hashlib import sha1
 from dataclasses import dataclass
+from pprint import pprint
 import sys
-from typing import Any
 import zlib
-import urllib.request
 
 from app.encoder import encode_object
-from app.packfile import parse_packfile
+from app.packfile import fetch_packfile, parse_packfile
+from app.pkt_line import decode_pkt_line, encode_pkt_line
+from app.protocol_v2 import v2_protocol_request
 from app.writer import write_contents_to_disk
 
 
@@ -152,7 +153,7 @@ def clone(url: str, directory: str):
     https://i27ae15.github.io/git-protocol-doc/docs/git-protocol/intro
     https://codewords.recurse.com/issues/three/unpacking-git-packfiles
     """
-    # CD to directory and run init
+    # Initialize the directory
     os.mkdir(directory)
     os.chdir(directory)
     init()
@@ -180,36 +181,39 @@ def clone(url: str, directory: str):
         if obj.type == "commit":
             _create_git_object(obj.data, "commit")
 
-    # Update HEAD ref
+    # Update HEAD reference
     ref_path = f".git/refs/heads/main"
     os.makedirs(os.path.dirname(ref_path), exist_ok=True)
     with open(ref_path, "w") as f:
         f.write(head_ref + "\n")
 
+    # Checkout the HEAD reference
+    checkout(head_ref)
+
 
 def ls_remote_head(url: str) -> str:
-    response = _v2_protocol_request(
+    response = v2_protocol_request(
         url=f"{url}/info/refs?service=git-upload-pack", method="GET"
     )
     lines = response.split(b"\n")
 
-    first_line, _ = _decode_pkt_line(lines[0])
+    first_line, _ = decode_pkt_line(lines[0])
     assert first_line == "# service=git-upload-pack"
-    second_line, _ = _decode_pkt_line(lines[1])
+    second_line, _ = decode_pkt_line(lines[1])
     assert second_line is None
 
     # Iterate for sanity's sake, but skip capability advertisement as a whole
     for line in lines[2:]:
-        parsed_line, _ = _decode_pkt_line(line)
+        parsed_line, _ = decode_pkt_line(line)
         if parsed_line is None:
             break
 
     # What we want is *reference advertisement*,
     # which in the v2 protocol is achieved with ls-refs
-    data = _encode_pkt_line("command=ls-refs")
+    data = encode_pkt_line("command=ls-refs")
     data += "0000"  # end of data
 
-    response = _v2_protocol_request(
+    response = v2_protocol_request(
         url=f"{url}/git-upload-pack", method="POST", data=data.encode()
     )
 
@@ -221,17 +225,67 @@ def ls_remote_head(url: str) -> str:
     raise Exception("HEAD ref not found!")
 
 
-def fetch_packfile(url: str, ref: str) -> bytes:
-    data = _encode_pkt_line("command=fetch")
-    data += "0001"  # section marker
-    data += _encode_pkt_line("no-progress")
-    data += _encode_pkt_line(f"want {ref}")
-    data += "0000"  # end of data
+def checkout(commit_sha1: str) -> None:
+    type_str, data = _read_git_object(commit_sha1)
+    if type_str != "commit":
+        raise ValueError(f"Expected commit object, got {type_str}")
 
-    response = _v2_protocol_request(
-        url=f"{url}/git-upload-pack", method="POST", data=data.encode()
-    )
-    return response
+    # A commit object's data looks like something like:
+    # tree 4e2e00e78d5e3ba51ad9f1846890328fb74d94a3
+    # author eaverdeja <eaverdeja@gmail.com> 1739006338 -0300
+    # committer eaverdeja <eaverdeja@gmail.com> 1739006338 -0300
+    # msg
+    commit_lines = data.decode().splitlines()
+    tree_line = next(line for line in commit_lines if line.startswith("tree "))
+    tree_sha1 = tree_line.split()[1]
+
+    _checkout_tree(tree_sha1)
+
+
+def _checkout_tree(tree_sha1: str, path: str = "") -> None:
+    type_str, data = _read_git_object(tree_sha1)
+    if type_str != "tree":
+        raise ValueError(f"Expected tree object, got {type_str}")
+
+    entries = _parse_tree(data)
+
+    for mode, name, sha1 in entries:
+        full_path = os.path.join(path, name)
+
+        if mode == "40000":
+            os.makedirs(full_path, exist_ok=True)
+            _checkout_tree(sha1, full_path)
+        else:
+            try:
+                type_str, data = _read_git_object(sha1)
+            except FileNotFoundError:
+                breakpoint()
+                print(full_path)
+                raise
+
+            if type_str != "blob":
+                raise ValueError(f"Expected blob object, got {type_str}")
+
+            with open(full_path, "wb") as f:
+                f.write(data)
+
+            os.chmod(full_path, int(mode, 8))
+
+
+def _read_git_object(sha1: str) -> tuple[str, bytes]:
+    obj_path = f".git/objects/{sha1[:2]}/{sha1[2:]}"
+    with open(obj_path, "rb") as file:
+        compressed = file.read()
+
+    raw = zlib.decompress(compressed)
+
+    header_end = raw.index(b"\x00")
+    header = raw[:header_end].decode()
+    type_str, size_str = header.split()
+
+    content = raw[header_end + 1 :]
+
+    return type_str, content
 
 
 def _create_git_object(
@@ -244,10 +298,9 @@ def _create_git_object(
     object_hash = sha1(blob_object).hexdigest()
 
     if should_write:
-        folder = object_hash[0:2]
+        folder = object_hash[:2]
         filename = object_hash[2:]
-        if not os.path.isdir(f".git/objects/{folder}"):
-            os.mkdir(f".git/objects/{folder}")
+        os.makedirs(f".git/objects/{folder}", exist_ok=True)
 
         compressed_object = zlib.compress(blob_object)
         with open(f".git/objects/{folder}/{filename}", "wb") as file:
@@ -256,26 +309,25 @@ def _create_git_object(
     return object_hash
 
 
-def _encode_pkt_line(line: str) -> str:
-    # +4 to include the padded length in the count
-    length = "{0:x}".format(len(line) + 4)
+def _parse_tree(data: bytes) -> list[tuple[str, str, str]]:
+    entries = []
+    i = 0
 
-    return f"{length.zfill(4)}{line}"
+    # A tree object looks something like this:
+    # {mode} {name}{hash}
+    # 100644 bar\x00\xe5\nI\xf9U\x8d\t\xd4\xd3\xbf\xc1\x086;\xb2L\x12~\xd2c
+    # 100644 foo\x00\x92\x9e\xfb0SE\x98SQ\x98p\x0b\x99N\xe48\xd4A\xd1\xaf
+    while i < len(data):
+        # Find the null byte separating the mode/name from the SHA-1 hash
+        null_pos = data.index(b"\x00", i)
 
+        mode_name = data[i:null_pos].decode()
+        mode, name = mode_name.split(" ")
+        sha1 = data[null_pos + 1 : null_pos + 1 + 20].hex()
 
-def _decode_pkt_line(line: bytes) -> tuple[str | None, int]:
-    length = int(line[:4], 16)
-    if length == 0:
-        return None, 0
-
-    return line[4:length].decode(), length
-
-
-def _v2_protocol_request(url: str, method: str, data: Any | None = None) -> bytes:
-    headers = {"git-protocol": "version=2"}
-    request = urllib.request.Request(method=method, url=url, headers=headers, data=data)
-    with urllib.request.urlopen(request) as response:
-        return response.read()
+        entries.append((mode, name, sha1))
+        i = null_pos + 1 + 20
+    return entries
 
 
 def _create_tree(path: str | None) -> list[TreeEntry]:

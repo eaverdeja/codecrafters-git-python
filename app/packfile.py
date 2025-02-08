@@ -4,6 +4,9 @@ import struct
 from typing import BinaryIO, Tuple, Generator
 from dataclasses import dataclass
 
+from app.pkt_line import encode_pkt_line
+from app.protocol_v2 import v2_protocol_request
+
 
 @dataclass
 class PackObject:
@@ -153,3 +156,15 @@ def parse_packfile(data: bytes) -> list[PackObject]:
     with BytesIO(data) as stream:
         parser = PackfileParser(stream)
         return list(parser.parse_objects())
+
+
+def fetch_packfile(url: str, ref: str) -> bytes:
+    data = encode_pkt_line("command=fetch")
+    data += "0001"  # section marker
+    data += encode_pkt_line("no-progress")
+    data += encode_pkt_line(f"want {ref}")
+    data += "0000"  # end of data
+
+    return v2_protocol_request(
+        url=f"{url}/git-upload-pack", method="POST", data=data.encode()
+    )
