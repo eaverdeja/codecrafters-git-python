@@ -83,7 +83,14 @@ def main():
 
             print(object_hash)
         case "clone":
-            clone()
+            parser = ArgumentParser(description="Clones a git repository")
+            parser.add_argument("url")
+            parser.add_argument("destination")
+            args = parser.parse_args(sys.argv[2:])
+            url = args.url
+            destination = args.destination
+
+            clone(url, destination)
         case _:
             raise RuntimeError(f"Unknown command #{command}")
 

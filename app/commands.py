@@ -3,9 +3,12 @@ import os
 from hashlib import sha1
 from dataclasses import dataclass
 import sys
+from typing import Any
 import zlib
+import requests
 
 from app.encoder import encode_object
+from app.packfile import parse_packfile
 from app.writer import write_contents_to_disk
 
 
@@ -155,12 +158,95 @@ def commit_tree(tree_sha: str, parent: str, message: str) -> str:
 
 def clone(url: str, directory: str):
     """
-    Just compiling some info and docs for now:
+    Useful docs and links:
+    https://git-scm.com/docs/gitprotocol-v2
     https://app.codecrafters.io/courses/git/stages/mg6
     https://forum.codecrafters.io/t/step-for-git-clone-implementing-the-git-protocol/4407/3
+    https://stefan.saasen.me/articles/git-clone-in-haskell-from-the-bottom-up
     https://i27ae15.github.io/git-protocol-doc/docs/git-protocol/intro
+    https://codewords.recurse.com/issues/three/unpacking-git-packfiles
     """
-    ...
+    # CD to directory and run init
+    # os.mkdir(directory)
+    # os.chdir(directory)
+    # init()
+
+    # Discover references
+    head_ref = ls_remote_head(url)
+
+    # Fetch packfile
+    packfile = fetch_packfile(url, head_ref)
+
+    parse_packfile(packfile)
+
+
+def ls_remote_head(url: str) -> str:
+    response = _v2_protocol_request(
+        url=f"{url}/info/refs?service=git-upload-pack", method="GET"
+    )
+    lines = response.content.split(b"\n")
+
+    first_line, _ = _decode_pkt_line(lines[0])
+    assert first_line == "# service=git-upload-pack"
+    second_line, _ = _decode_pkt_line(lines[1])
+    assert second_line is None
+
+    # Iterate for sanity's sake, but skip capability advertisement as a whole
+    for line in lines[2:]:
+        parsed_line, _ = _decode_pkt_line(line)
+        if parsed_line is None:
+            break
+
+    # What we want is *reference advertisement*,
+    # which in the v2 protocol is achieved with ls-refs
+    data = _encode_pkt_line("command=ls-refs")
+    data += "0000"  # end of data
+
+    response = _v2_protocol_request(
+        url=f"{url}/git-upload-pack", method="POST", data=data
+    )
+
+    for line in response.content.split(b"\n"):
+        if b"HEAD" in line:
+            # SHA hash is 40 bytes in length
+            return line[4 : 40 + 4].decode()
+
+    raise Exception("HEAD ref not found!")
+
+
+def fetch_packfile(url: str, ref: str) -> bytes:
+    data = _encode_pkt_line("command=fetch")
+    data += "0001"  # section marker
+    data += _encode_pkt_line("no-progress")
+    data += _encode_pkt_line(f"want {ref}")
+    data += "0000"  # end of data
+
+    response = _v2_protocol_request(
+        url=f"{url}/git-upload-pack", method="POST", data=data
+    )
+    return response.content
+
+
+def _encode_pkt_line(line: str) -> str:
+    # +4 to include the padded length in the count
+    length = "{0:x}".format(len(line) + 4)
+
+    return f"{length.zfill(4)}{line}"
+
+
+def _decode_pkt_line(line: bytes) -> tuple[str | None, int]:
+    length = int(line[:4], 16)
+    if length == 0:
+        return None, 0
+
+    return line[4:length].decode(), length
+
+
+def _v2_protocol_request(
+    url: str, method: str, data: Any | None = None
+) -> requests.Response:
+    headers = {"git-protocol": "version=2"}
+    return requests.request(method=method, url=url, headers=headers, data=data)
 
 
 def _create_tree(path: str | None) -> list[TreeEntry]:
