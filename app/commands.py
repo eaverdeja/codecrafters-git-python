@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import sys
 from typing import Any
 import zlib
-import requests
+import urllib.request
 
 from app.encoder import encode_object
 from app.packfile import parse_packfile
@@ -78,21 +78,7 @@ def hash_object() -> str:
     with open(file_name, "rb") as file:
         contents = file.read()
 
-    content_length = len(contents)
-    blob_object = b"blob " + str(content_length).encode() + b"\0" + contents
-    object_hash = sha1(blob_object).hexdigest()
-
-    if args.write:
-        folder = object_hash[0:2]
-        filename = object_hash[2:]
-        if not os.path.isdir(f".git/objects/{folder}"):
-            os.mkdir(f".git/objects/{folder}")
-
-        compressed_object = zlib.compress(blob_object)
-        with open(f".git/objects/{folder}/{filename}", "wb") as file:
-            file.write(compressed_object)
-
-    return object_hash
+    return _create_git_object(contents, "blob", args.write)
 
 
 def ls_tree(tree_hash: str) -> list[TreeEntry]:
@@ -167,9 +153,9 @@ def clone(url: str, directory: str):
     https://codewords.recurse.com/issues/three/unpacking-git-packfiles
     """
     # CD to directory and run init
-    # os.mkdir(directory)
-    # os.chdir(directory)
-    # init()
+    os.mkdir(directory)
+    os.chdir(directory)
+    init()
 
     # Discover references
     head_ref = ls_remote_head(url)
@@ -177,14 +163,35 @@ def clone(url: str, directory: str):
     # Fetch packfile
     packfile = fetch_packfile(url, head_ref)
 
-    parse_packfile(packfile)
+    # Parse the packfile
+    pack_objects = parse_packfile(packfile)
+
+    # Create git objects. These need to be done sequentially
+    # in order to ensure proper references from commit -> tree -> blob
+    for obj in pack_objects:
+        if obj.type == "blob":
+            _create_git_object(obj.data, "blob")
+
+    for obj in pack_objects:
+        if obj.type == "tree":
+            _create_git_object(obj.data, "tree")
+
+    for obj in pack_objects:
+        if obj.type == "commit":
+            _create_git_object(obj.data, "commit")
+
+    # Update HEAD ref
+    ref_path = f".git/refs/heads/main"
+    os.makedirs(os.path.dirname(ref_path), exist_ok=True)
+    with open(ref_path, "w") as f:
+        f.write(head_ref + "\n")
 
 
 def ls_remote_head(url: str) -> str:
     response = _v2_protocol_request(
         url=f"{url}/info/refs?service=git-upload-pack", method="GET"
     )
-    lines = response.content.split(b"\n")
+    lines = response.split(b"\n")
 
     first_line, _ = _decode_pkt_line(lines[0])
     assert first_line == "# service=git-upload-pack"
@@ -203,10 +210,10 @@ def ls_remote_head(url: str) -> str:
     data += "0000"  # end of data
 
     response = _v2_protocol_request(
-        url=f"{url}/git-upload-pack", method="POST", data=data
+        url=f"{url}/git-upload-pack", method="POST", data=data.encode()
     )
 
-    for line in response.content.split(b"\n"):
+    for line in response.split(b"\n"):
         if b"HEAD" in line:
             # SHA hash is 40 bytes in length
             return line[4 : 40 + 4].decode()
@@ -222,9 +229,31 @@ def fetch_packfile(url: str, ref: str) -> bytes:
     data += "0000"  # end of data
 
     response = _v2_protocol_request(
-        url=f"{url}/git-upload-pack", method="POST", data=data
+        url=f"{url}/git-upload-pack", method="POST", data=data.encode()
     )
-    return response.content
+    return response
+
+
+def _create_git_object(
+    contents: bytes, obj_type: str, should_write: bool = True
+) -> str:
+    content_length = len(contents)
+    blob_object = (
+        obj_type.encode() + b" " + str(content_length).encode() + b"\0" + contents
+    )
+    object_hash = sha1(blob_object).hexdigest()
+
+    if should_write:
+        folder = object_hash[0:2]
+        filename = object_hash[2:]
+        if not os.path.isdir(f".git/objects/{folder}"):
+            os.mkdir(f".git/objects/{folder}")
+
+        compressed_object = zlib.compress(blob_object)
+        with open(f".git/objects/{folder}/{filename}", "wb") as file:
+            file.write(compressed_object)
+
+    return object_hash
 
 
 def _encode_pkt_line(line: str) -> str:
@@ -242,11 +271,11 @@ def _decode_pkt_line(line: bytes) -> tuple[str | None, int]:
     return line[4:length].decode(), length
 
 
-def _v2_protocol_request(
-    url: str, method: str, data: Any | None = None
-) -> requests.Response:
+def _v2_protocol_request(url: str, method: str, data: Any | None = None) -> bytes:
     headers = {"git-protocol": "version=2"}
-    return requests.request(method=method, url=url, headers=headers, data=data)
+    request = urllib.request.Request(method=method, url=url, headers=headers, data=data)
+    with urllib.request.urlopen(request) as response:
+        return response.read()
 
 
 def _create_tree(path: str | None) -> list[TreeEntry]:
