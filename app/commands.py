@@ -7,6 +7,7 @@ import sys
 import zlib
 
 from app.encoder import encode_object
+from app.git_object import create_git_object
 from app.packfile import fetch_packfile, parse_packfile
 from app.pkt_line import decode_pkt_line, encode_pkt_line
 from app.protocol_v2 import v2_protocol_request
@@ -79,7 +80,7 @@ def hash_object() -> str:
     with open(file_name, "rb") as file:
         contents = file.read()
 
-    return _create_git_object(contents, "blob", args.write)
+    return create_git_object(contents, "blob", args.write)
 
 
 def ls_tree(tree_hash: str) -> list[TreeEntry]:
@@ -171,15 +172,15 @@ def clone(url: str, directory: str):
     # in order to ensure proper references from commit -> tree -> blob
     for obj in pack_objects:
         if obj.type == "blob":
-            _create_git_object(obj.data, "blob")
+            create_git_object(obj.data, "blob")
 
     for obj in pack_objects:
         if obj.type == "tree":
-            _create_git_object(obj.data, "tree")
+            create_git_object(obj.data, "tree")
 
     for obj in pack_objects:
         if obj.type == "commit":
-            _create_git_object(obj.data, "commit")
+            create_git_object(obj.data, "commit")
 
     # Update HEAD reference
     ref_path = f".git/refs/heads/main"
@@ -286,27 +287,6 @@ def _read_git_object(sha1: str) -> tuple[str, bytes]:
     content = raw[header_end + 1 :]
 
     return type_str, content
-
-
-def _create_git_object(
-    contents: bytes, obj_type: str, should_write: bool = True
-) -> str:
-    content_length = len(contents)
-    blob_object = (
-        obj_type.encode() + b" " + str(content_length).encode() + b"\0" + contents
-    )
-    object_hash = sha1(blob_object).hexdigest()
-
-    if should_write:
-        folder = object_hash[:2]
-        filename = object_hash[2:]
-        os.makedirs(f".git/objects/{folder}", exist_ok=True)
-
-        compressed_object = zlib.compress(blob_object)
-        with open(f".git/objects/{folder}/{filename}", "wb") as file:
-            file.write(compressed_object)
-
-    return object_hash
 
 
 def _parse_tree(data: bytes) -> list[tuple[str, str, str]]:

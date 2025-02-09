@@ -4,6 +4,7 @@ import struct
 from typing import BinaryIO, Tuple, Generator
 from dataclasses import dataclass
 
+from app.git_object import create_git_object
 from app.pkt_line import encode_pkt_line
 from app.protocol_v2 import v2_protocol_request
 
@@ -14,6 +15,7 @@ class PackObject:
     size: int
     data: bytes
     offset: int
+    base_sha: str | None = None
 
 
 class PackfileParser:
@@ -126,6 +128,7 @@ class PackfileParser:
         size, obj_type = self._read_varint()
 
         # For delta objects, read the base offset/reference
+        base_sha = None
         if obj_type == "ofs_delta":
             offset = 0
             shift = 0
@@ -136,19 +139,175 @@ class PackfileParser:
                 if not (byte & 0x80):
                     break
         elif obj_type == "ref_delta":
-            self._read_bytes(20)  # Base object SHA-1
+            base_sha = self._read_bytes(20).hex()  # Base object SHA-1
+            print("base sha1 from ref_delta: ", base_sha)
 
         # Read and decompress the object data
         data = self._read_compressed_data()
 
-        return PackObject(type=obj_type, size=size, data=data, offset=start_offset)
+        return PackObject(
+            type=obj_type,
+            size=size,
+            data=data,
+            offset=start_offset,
+            base_sha=base_sha,
+        )
+
+    def _resolve_deltas(self, objects: list[PackObject]) -> list[PackObject]:
+        """Resolve all delta objects iteratively."""
+        base_objects = {}
+        delta_objects: list[PackObject] = []
+
+        # Debug: Print all object types we receive
+        for obj in objects:
+            if obj.type == "ofs_delta":
+                # Skip OFS_DELTA objects
+                continue
+            elif obj.type == "ref_delta":
+                delta_objects.append(obj)
+            else:
+                # Store the SHA-1 of this object
+                obj_sha = create_git_object(obj.data, obj.type, should_write=False)
+                base_objects[obj_sha] = obj
+
+        print(f"\nNumber of base objects: {len(base_objects)}")
+        print(f"Number of delta objects to resolve: {len(delta_objects)}")
+
+        # Keep processing deltas until we can't resolve any more
+        iteration = 0
+        while delta_objects:
+            iteration += 1
+            print(f"\nIteration {iteration}:")
+            made_progress = False
+            remaining_deltas = []
+
+            for delta in delta_objects:
+                print(f"Attempting to resolve delta with base SHA: {delta.base_sha}")
+                base_obj = base_objects.get(delta.base_sha or "")
+                if base_obj is None:
+                    print(f"Base object not found for SHA: {delta.base_sha}")
+                    remaining_deltas.append(delta)
+                    continue
+
+                # Resolve the delta
+                resolved_data = self._apply_delta(base_obj.data, delta.data)
+                resolved_obj = PackObject(
+                    type=base_obj.type,
+                    size=len(resolved_data),
+                    data=resolved_data,
+                    offset=delta.offset,
+                )
+
+                # Store the resolved object as a potential base for other deltas
+                obj_sha = create_git_object(
+                    resolved_data, base_obj.type, should_write=False
+                )
+                base_objects[obj_sha] = resolved_obj
+                made_progress = True
+                print(f"Successfully resolved delta, new object SHA: {obj_sha}")
+
+            print(f"Remaining deltas after iteration: {len(remaining_deltas)}")
+
+            # Update our list of deltas to process
+            delta_objects = remaining_deltas
+
+            # If we made no progress in this iteration and there are still deltas,
+            # then we have truly unresolvable deltas
+            if not made_progress and delta_objects:
+                print("\nFailed to resolve these deltas' base SHAs:")
+                for delta in delta_objects:
+                    print(f"- {delta.base_sha}")
+                raise ValueError("Could not resolve all delta objects")
+
+        # Return all resolved objects
+        return list(base_objects.values())
+
+    def _apply_delta(self, base_data: bytes, delta_data: bytes) -> bytes:
+        source_size = 0
+        target_size = 0
+        pos = 0
+
+        # source size
+        shift = 0
+        while True:
+            byte = delta_data[pos]
+            source_size |= (byte & 0x7F) << shift
+            pos += 1
+            if not (byte & 0x80):
+                break
+            shift += 7
+
+        # target size
+        shift = 0
+        while True:
+            byte = delta_data[pos]
+            target_size |= (byte & 0x7F) << shift
+            pos += 1
+            if not (byte & 0x80):
+                break
+            shift += 7
+
+        if len(base_data) != (source_size):
+            raise ValueError(
+                f"Base object size mismatch: expected {source_size} got {len(base_data)}"
+            )
+
+        result = bytearray()
+
+        while pos < len(delta_data):
+            cmd = delta_data[pos]
+            pos += 1
+
+            if cmd & 0x80:  # Copy
+                copy_offset = 0
+                copy_size = 0
+
+                if cmd & 0x01:
+                    copy_offset = delta_data[pos]
+                    pos += 1
+                if cmd & 0x02:
+                    copy_offset |= delta_data[pos] << 8
+                    pos += 1
+                if cmd & 0x04:
+                    copy_offset |= delta_data[pos] << 16
+                    pos += 1
+                if cmd & 0x08:
+                    copy_offset |= delta_data[pos] << 24
+                    pos += 1
+
+                if cmd & 0x10:
+                    copy_size = delta_data[pos]
+                    pos += 1
+                if cmd & 0x20:
+                    copy_size |= delta_data[pos] << 8
+                    pos += 1
+                if cmd & 0x40:
+                    copy_size |= delta_data[pos] << 16
+                    pos += 1
+
+                if copy_size == 0:
+                    copy_size = 0x10000
+
+                result.extend(base_data[copy_offset : copy_offset + copy_size])
+            else:  # Insert
+                result.extend(delta_data[pos : pos + cmd])
+                pos += cmd
+
+        if len(result) != target_size:
+            breakpoint()
+            raise ValueError(
+                f"Target object size mismatch: expected {target_size} got {len(result)}"
+            )
+
+        return result
 
     def parse_objects(self) -> Generator[PackObject, None, None]:
         """Parse all objects in the packfile."""
-        signature, version, num_objects = self._parse_header()
+        _signature, _version, num_objects = self._parse_header()
 
-        for _ in range(num_objects):
-            yield self._parse_object()
+        objects = [self._parse_object() for _ in range(num_objects)]
+        for obj in self._resolve_deltas(objects):
+            yield obj
 
 
 def parse_packfile(data: bytes) -> list[PackObject]:
