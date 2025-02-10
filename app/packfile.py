@@ -104,23 +104,59 @@ class PackfileParser:
 
         return size, types.get(type_id, f"unknown_{type_id}")
 
-    def _read_compressed_data(self) -> bytes:
-        """Read zlib compressed data from the current position."""
-        decompressor = zlib.decompressobj()
-        data = b""
+    def _read_compressed_data(self, size: int, is_delta: bool = False) -> bytes:
+        """
+        Read zlib compressed data with proper stream handling.
+        """
+        # First, try to find the start of a valid zlib stream
+        # Look for common zlib header bytes (0x78 followed by 0x01, 0x9C, or 0xDA)
         while True:
-            byte = self.stream.read(1)
-            if not byte:
-                break
-            try:
-                data += decompressor.decompress(byte)
-                if decompressor.eof:
-                    break
-            except zlib.error:
-                self.stream.seek(-1, 1)  # Go back one byte
-                break
+            header = self.stream.read(2)
+            if not header:
+                raise EOFError("Unexpected end of packfile")
 
-        return data
+            if header[0] == 0x78 and header[1] in (0x01, 0x9C, 0xDA):
+                # Found a valid zlib header
+                self.stream.seek(-2, 1)  # Go back to start of header
+                break
+            else:
+                self.stream.seek(-1, 1)  # Go back one byte and try again
+
+        # Now we're at the start of a zlib stream
+        decompressor = zlib.decompressobj()
+        uncompressed_data = bytearray()
+
+        # Read an initial chunk that should contain the whole object
+        # For deltas, we read a smaller amount since they're typically smaller
+        initial_read = 512 if is_delta else 4096
+        compressed_data = self.stream.read(initial_read)
+
+        try:
+            chunk = decompressor.decompress(compressed_data)
+            uncompressed_data.extend(chunk)
+
+            # If we have unused data, seek back
+            if decompressor.unused_data:
+                self.stream.seek(-len(decompressor.unused_data), 1)
+
+        except zlib.error as e:
+            # If we get an error, try reading byte by byte
+            self.stream.seek(-len(compressed_data), 1)  # Go back
+            while len(uncompressed_data) < size:
+                byte = self.stream.read(1)
+                if not byte:
+                    break
+
+                try:
+                    chunk = decompressor.decompress(byte)
+                    if chunk:
+                        uncompressed_data.extend(chunk)
+                    if decompressor.eof:
+                        break
+                except zlib.error:
+                    break
+
+        return bytes(uncompressed_data)
 
     def _parse_object(self) -> PackObject:
         """Parse a single object from the packfile."""
@@ -140,10 +176,10 @@ class PackfileParser:
                     break
         elif obj_type == "ref_delta":
             base_sha = self._read_bytes(20).hex()  # Base object SHA-1
-            print("base sha1 from ref_delta: ", base_sha)
 
         # Read and decompress the object data
-        data = self._read_compressed_data()
+        is_delta = obj_type in ("ref_delta", "ofs_delta")
+        data = self._read_compressed_data(size, is_delta)
 
         return PackObject(
             type=obj_type,
@@ -158,66 +194,59 @@ class PackfileParser:
         base_objects = {}
         delta_objects: list[PackObject] = []
 
-        # Debug: Print all object types we receive
         for obj in objects:
             if obj.type == "ofs_delta":
                 # Skip OFS_DELTA objects
                 continue
             elif obj.type == "ref_delta":
+                create_git_object(obj.data, obj.type)
                 delta_objects.append(obj)
             else:
                 # Store the SHA-1 of this object
-                obj_sha = create_git_object(obj.data, obj.type, should_write=False)
+                obj_sha = create_git_object(obj.data, obj.type)
                 base_objects[obj_sha] = obj
 
         print(f"\nNumber of base objects: {len(base_objects)}")
         print(f"Number of delta objects to resolve: {len(delta_objects)}")
 
         # Keep processing deltas until we can't resolve any more
-        iteration = 0
-        while delta_objects:
-            iteration += 1
-            print(f"\nIteration {iteration}:")
-            made_progress = False
-            remaining_deltas = []
+        made_progress = False
+        remaining_deltas = []
 
+        for delta in delta_objects:
+            print(f"Attempting to resolve delta with base SHA: {delta.base_sha}")
+            base_obj = base_objects.get(delta.base_sha or "")
+            if base_obj is None:
+                print(f"Base object not found for SHA: {delta.base_sha}")
+                remaining_deltas.append(delta)
+                continue
+
+            # Resolve the delta
+            resolved_data = self._apply_delta(base_obj.data, delta.data)
+            resolved_obj = PackObject(
+                type=base_obj.type,
+                size=len(resolved_data),
+                data=resolved_data,
+                offset=delta.offset,
+            )
+
+            # Store the resolved object as a potential base for other deltas
+            obj_sha = create_git_object(resolved_obj.data, resolved_obj.type)
+            base_objects[obj_sha] = resolved_obj
+            made_progress = True
+            print(f"Successfully resolved delta, new object SHA: {obj_sha}")
+
+        print(f"Remaining deltas after iteration: {len(remaining_deltas)}")
+        # Update our list of deltas to process
+        delta_objects = remaining_deltas
+
+        # If we made no progress in this iteration and there are still deltas,
+        # then we have truly unresolvable deltas
+        if not made_progress and delta_objects:
+            print("\nFailed to resolve these deltas' base SHAs:")
             for delta in delta_objects:
-                print(f"Attempting to resolve delta with base SHA: {delta.base_sha}")
-                base_obj = base_objects.get(delta.base_sha or "")
-                if base_obj is None:
-                    print(f"Base object not found for SHA: {delta.base_sha}")
-                    remaining_deltas.append(delta)
-                    continue
-
-                # Resolve the delta
-                resolved_data = self._apply_delta(base_obj.data, delta.data)
-                resolved_obj = PackObject(
-                    type=base_obj.type,
-                    size=len(resolved_data),
-                    data=resolved_data,
-                    offset=delta.offset,
-                )
-
-                # Store the resolved object as a potential base for other deltas
-                obj_sha = create_git_object(
-                    resolved_data, base_obj.type, should_write=False
-                )
-                base_objects[obj_sha] = resolved_obj
-                made_progress = True
-                print(f"Successfully resolved delta, new object SHA: {obj_sha}")
-
-            print(f"Remaining deltas after iteration: {len(remaining_deltas)}")
-
-            # Update our list of deltas to process
-            delta_objects = remaining_deltas
-
-            # If we made no progress in this iteration and there are still deltas,
-            # then we have truly unresolvable deltas
-            if not made_progress and delta_objects:
-                print("\nFailed to resolve these deltas' base SHAs:")
-                for delta in delta_objects:
-                    print(f"- {delta.base_sha}")
-                raise ValueError("Could not resolve all delta objects")
+                print(f"- {delta.base_sha} - {delta.type}")
+            raise ValueError("Could not resolve all delta objects")
 
         # Return all resolved objects
         return list(base_objects.values())

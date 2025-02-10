@@ -168,19 +168,9 @@ def clone(url: str, directory: str):
     # Parse the packfile
     pack_objects = parse_packfile(packfile)
 
-    # Create git objects. These need to be done sequentially
-    # in order to ensure proper references from commit -> tree -> blob
+    # Create the git objects
     for obj in pack_objects:
-        if obj.type == "blob":
-            create_git_object(obj.data, "blob")
-
-    for obj in pack_objects:
-        if obj.type == "tree":
-            create_git_object(obj.data, "tree")
-
-    for obj in pack_objects:
-        if obj.type == "commit":
-            create_git_object(obj.data, "commit")
+        create_git_object(obj.data, obj.type, should_write=True)
 
     # Update HEAD reference
     ref_path = f".git/refs/heads/main"
@@ -257,12 +247,7 @@ def _checkout_tree(tree_sha1: str, path: str = "") -> None:
             os.makedirs(full_path, exist_ok=True)
             _checkout_tree(sha1, full_path)
         else:
-            try:
-                type_str, data = _read_git_object(sha1)
-            except FileNotFoundError:
-                breakpoint()
-                print(full_path)
-                raise
+            type_str, data = _read_git_object(sha1)
 
             if type_str != "blob":
                 raise ValueError(f"Expected blob object, got {type_str}")
