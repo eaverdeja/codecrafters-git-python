@@ -234,7 +234,12 @@ def checkout(commit_sha1: str) -> None:
 
 
 def _checkout_tree(tree_sha1: str, path: str = "") -> None:
-    type_str, data = _read_git_object(tree_sha1)
+    try:
+        type_str, data = _read_git_object(tree_sha1)
+    except FileNotFoundError:
+        print(f"Could not find git object {tree_sha1}")
+        return
+
     if type_str != "tree":
         raise ValueError(f"Expected tree object, got {type_str}")
 
