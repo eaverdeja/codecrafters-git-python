@@ -14,7 +14,6 @@ class PackObject:
     type: str
     size: int
     data: bytes
-    offset: int
     base_sha: str | None = None
 
 
@@ -24,45 +23,16 @@ class PackfileParser:
         stream: BinaryIO,
     ):
         self.stream = stream
-        self.offset = 0
 
-    def _read_bytes(self, n: int) -> bytes:
-        data = self.stream.read(n)
-        if not data and n > 0:
-            raise EOFError("Unexpected end of file")
-        self.offset += len(data)
-        return data
+    def parse_objects(self) -> Generator[PackObject, None, None]:
+        """Parse all objects in the packfile."""
+        _signature, _version, num_objects = self._parse_header()
 
-    def _read_pktline(self) -> bytes:
-        """Read a packet line according to Git's pkt-line format."""
-        length_hex = self._read_bytes(4).decode("ascii")
-        try:
-            length = int(length_hex, 16)
-        except ValueError:
-            raise ValueError(f"Invalid packet line length: {length_hex}")
-
-        if length == 0:
-            return b""  # Flush packet
-        if length < 4:
-            raise ValueError(f"Invalid packet line length: {length}")
-
-        content = self._read_bytes(length - 4)
-
-        return content
-
-    def _skip_until_pack(self):
-        """Skip through pktlines until we find the PACK signature."""
-        while True:
-            data = self.stream.read(4)
-            if not data:
-                raise ValueError("Reached end of file without finding PACK signature")
-            if data == b"PACK":
-                self.stream.seek(-4, 1)
-                return
-            self.stream.seek(-3, 1)
+        objects = [self._parse_object() for _ in range(num_objects)]
+        for obj in self._resolve_deltas(objects):
+            yield obj
 
     def _parse_header(self) -> Tuple[str, int, int]:
-        """Parse the packfile header and return signature and version."""
         pktline = self._read_pktline()
         if not pktline.startswith(b"packfile\n"):
             raise ValueError(f"Expected packfile announcement, got: {pktline!r}")
@@ -81,33 +51,44 @@ class PackfileParser:
 
         return signature.decode(), version, num_objects
 
-    def _read_varint(self) -> Tuple[int, str]:
-        """Read a variable-length integer and object type."""
-        byte = self._read_bytes(1)[0]
-        type_id = (byte >> 4) & 7
-        size = byte & 0x0F
-        shift = 4
+    def _skip_until_pack(self):
+        while True:
+            data = self.stream.read(4)
+            if not data:
+                raise ValueError("Reached end of file without finding PACK signature")
+            if data == b"PACK":
+                self.stream.seek(-4, 1)
+                return
+            self.stream.seek(-3, 1)
 
-        while byte & 0x80:
-            byte = self._read_bytes(1)[0]
-            size |= (byte & 0x7F) << shift
-            shift += 7
+    def _parse_object(self) -> PackObject:
+        size, obj_type = self._read_varint()
 
-        types = {
-            1: "commit",
-            2: "tree",
-            3: "blob",
-            4: "tag",
-            6: "ofs_delta",
-            7: "ref_delta",
-        }
+        # For delta objects, read the base offset/reference
+        base_sha = None
+        if obj_type == "ofs_delta":
+            offset = 0
+            shift = 0
+            while True:
+                byte = self._read_bytes(1)[0]
+                offset |= (byte & 0x7F) << shift
+                shift += 7
+                if not (byte & 0x80):
+                    break
+        elif obj_type == "ref_delta":
+            base_sha = self._read_bytes(20).hex()  # Base object SHA-1
 
-        return size, types.get(type_id, f"unknown_{type_id}")
+        # Read and decompress the object data
+        data = self._read_compressed_data(size)
 
-    def _read_compressed_data(self, size: int, is_delta: bool = False) -> bytes:
-        """
-        Read zlib compressed data with proper stream handling.
-        """
+        return PackObject(
+            type=obj_type,
+            size=size,
+            data=data,
+            base_sha=base_sha,
+        )
+
+    def _read_compressed_data(self, size: int) -> bytes:
         # First, try to find the start of a valid zlib stream
         # Look for common zlib header bytes (0x78 followed by 0x01, 0x9C, or 0xDA)
         while True:
@@ -126,10 +107,8 @@ class PackfileParser:
         decompressor = zlib.decompressobj()
         uncompressed_data = bytearray()
 
-        # Read an initial chunk that should contain the whole object
-        # For deltas, we read a smaller amount since they're typically smaller
-        initial_read = 512 if is_delta else 4096
-        compressed_data = self.stream.read(initial_read)
+        # 4kb chunks
+        compressed_data = self.stream.read(4096)
 
         try:
             chunk = decompressor.decompress(compressed_data)
@@ -153,44 +132,13 @@ class PackfileParser:
                         uncompressed_data.extend(chunk)
                     if decompressor.eof:
                         break
-                except zlib.error:
+                except zlib.error as e:
+                    breakpoint()
                     break
 
         return bytes(uncompressed_data)
 
-    def _parse_object(self) -> PackObject:
-        """Parse a single object from the packfile."""
-        start_offset = self.offset
-        size, obj_type = self._read_varint()
-
-        # For delta objects, read the base offset/reference
-        base_sha = None
-        if obj_type == "ofs_delta":
-            offset = 0
-            shift = 0
-            while True:
-                byte = self._read_bytes(1)[0]
-                offset |= (byte & 0x7F) << shift
-                shift += 7
-                if not (byte & 0x80):
-                    break
-        elif obj_type == "ref_delta":
-            base_sha = self._read_bytes(20).hex()  # Base object SHA-1
-
-        # Read and decompress the object data
-        is_delta = obj_type in ("ref_delta", "ofs_delta")
-        data = self._read_compressed_data(size, is_delta)
-
-        return PackObject(
-            type=obj_type,
-            size=size,
-            data=data,
-            offset=start_offset,
-            base_sha=base_sha,
-        )
-
     def _resolve_deltas(self, objects: list[PackObject]) -> list[PackObject]:
-        """Resolve all delta objects iteratively."""
         base_objects = {}
         delta_objects: list[PackObject] = []
 
@@ -199,7 +147,7 @@ class PackfileParser:
                 # Skip OFS_DELTA objects
                 continue
             elif obj.type == "ref_delta":
-                create_git_object(obj.data, obj.type)
+                create_git_object(obj.data, obj.type, should_write=False)
                 delta_objects.append(obj)
             else:
                 # Store the SHA-1 of this object
@@ -227,7 +175,6 @@ class PackfileParser:
                 type=base_obj.type,
                 size=len(resolved_data),
                 data=resolved_data,
-                offset=delta.offset,
             )
 
             # Store the resolved object as a potential base for other deltas
@@ -330,13 +277,49 @@ class PackfileParser:
 
         return result
 
-    def parse_objects(self) -> Generator[PackObject, None, None]:
-        """Parse all objects in the packfile."""
-        _signature, _version, num_objects = self._parse_header()
+    def _read_bytes(self, n: int) -> bytes:
+        data = self.stream.read(n)
+        if not data and n > 0:
+            raise EOFError("Unexpected end of file")
+        return data
 
-        objects = [self._parse_object() for _ in range(num_objects)]
-        for obj in self._resolve_deltas(objects):
-            yield obj
+    def _read_pktline(self) -> bytes:
+        length_hex = self._read_bytes(4).decode("ascii")
+        try:
+            length = int(length_hex, 16)
+        except ValueError:
+            raise ValueError(f"Invalid packet line length: {length_hex}")
+
+        if length == 0:
+            return b""  # Flush packet
+        if length < 4:
+            raise ValueError(f"Invalid packet line length: {length}")
+
+        content = self._read_bytes(length - 4)
+
+        return content
+
+    def _read_varint(self) -> Tuple[int, str]:
+        byte = self._read_bytes(1)[0]
+        type_id = (byte >> 4) & 7
+        size = byte & 0x0F
+        shift = 4
+
+        while byte & 0x80:
+            byte = self._read_bytes(1)[0]
+            size |= (byte & 0x7F) << shift
+            shift += 7
+
+        types = {
+            1: "commit",
+            2: "tree",
+            3: "blob",
+            4: "tag",
+            6: "ofs_delta",
+            7: "ref_delta",
+        }
+
+        return size, types.get(type_id, f"unknown_{type_id}")
 
 
 def parse_packfile(data: bytes) -> list[PackObject]:
