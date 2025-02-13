@@ -64,18 +64,8 @@ class PackfileParser:
     def _parse_object(self) -> PackObject:
         size, obj_type = self._read_varint()
 
-        # For delta objects, read the base offset/reference
         base_sha = None
-        if obj_type == "ofs_delta":
-            offset = 0
-            shift = 0
-            while True:
-                byte = self._read_bytes(1)[0]
-                offset |= (byte & 0x7F) << shift
-                shift += 7
-                if not (byte & 0x80):
-                    break
-        elif obj_type == "ref_delta":
+        if obj_type == "ref_delta":
             base_sha = self._read_bytes(20).hex()  # Base object SHA-1
 
         # Read and decompress the object data
@@ -153,18 +143,13 @@ class PackfileParser:
                 obj_sha = create_git_object(obj.data, obj.type)
                 base_objects[obj_sha] = obj
 
-        print(f"\nNumber of base objects: {len(base_objects)}")
-        print(f"Number of delta objects to resolve: {len(delta_objects)}")
-
         # Keep processing deltas until we can't resolve any more
         made_progress = False
         remaining_deltas = []
 
         for delta in delta_objects:
-            print(f"Attempting to resolve delta with base SHA: {delta.base_sha}")
             base_obj = base_objects.get(delta.base_sha or "")
             if base_obj is None:
-                print(f"Base object not found for SHA: {delta.base_sha}")
                 remaining_deltas.append(delta)
                 continue
 
@@ -180,18 +165,13 @@ class PackfileParser:
             obj_sha = create_git_object(resolved_obj.data, resolved_obj.type)
             base_objects[obj_sha] = resolved_obj
             made_progress = True
-            print(f"Successfully resolved delta, new object SHA: {obj_sha}")
 
-        print(f"Remaining deltas after iteration: {len(remaining_deltas)}")
         # Update our list of deltas to process
         delta_objects = remaining_deltas
 
         # If we made no progress in this iteration and there are still deltas,
         # then we have truly unresolvable deltas
         if not made_progress and delta_objects:
-            print("\nFailed to resolve these deltas' base SHAs:")
-            for delta in delta_objects:
-                print(f"- {delta.base_sha} - {delta.type}")
             raise ValueError("Could not resolve all delta objects")
 
         # Return all resolved objects
@@ -322,7 +302,6 @@ class PackfileParser:
 
 
 def parse_packfile(data: bytes) -> list[PackObject]:
-    """Parse a packfile and print information about its contents."""
     with BytesIO(data) as stream:
         parser = PackfileParser(stream)
         return list(parser.parse_objects())
